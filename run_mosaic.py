@@ -18,20 +18,20 @@ Usage:
         --target tests/space.png \
         --source-images ./source_images \
         --color "#0000FF" \
-        --scale 8
+        --scale 12
 
     # Using synthetic tiles (Option B: texture/block mosaic)
     python run_mosaic.py \
         --target tests/space.png \
         --synthetic blocks \
-        --tile-count 30 \
+        --tile-count 50 \
         --color "#0000FF" \
-        --scale 8
+        --scale 12
 
     # Skip mosaic step (just prepare tiles + target, run mosaic.py yourself)
     python run_mosaic.py \
         --target tests/space.png \
-        --synthetic gradient \
+        --synthetic blocks \
         --color "#0044CC" \
         --prepare-only
 """
@@ -98,7 +98,7 @@ def main():
     )
     tile_group.add_argument(
         "--synthetic", dest="synthetic", type=str,
-        choices=["gradient", "blocks", "halftone", "all"],
+        choices=["blocks", "halftone", "crosshatch", "noise", "all"],
         help="Generate synthetic tiles instead (Option B)"
     )
 
@@ -113,13 +113,13 @@ def main():
     )
 
     # Mosaic settings
-    parser.add_argument("--scale", type=int, default=8, help="Tile scale (default: 8)")
+    parser.add_argument("--scale", type=int, default=12, help="Tile scale (default: 12)")
     parser.add_argument("--height-aspect", dest="height_aspect", type=float, default=4.0)
     parser.add_argument("--width-aspect", dest="width_aspect", type=float, default=3.0)
     parser.add_argument("--opacity", type=float, default=0.0, help="Opacity overlay (default: 0.0)")
     parser.add_argument("--best-k", dest="best_k", type=int, default=1, help="Top-K tile selection")
-    parser.add_argument("--tile-count", dest="tile_count", type=int, default=20,
-                        help="Number of synthetic tiles to generate (default: 20)")
+    parser.add_argument("--tile-count", dest="tile_count", type=int, default=50,
+                        help="Number of synthetic tiles to generate (default: 50)")
 
     # Output settings
     parser.add_argument(
