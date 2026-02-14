@@ -1,43 +1,36 @@
 """
 blue_mosaic.py - Standalone "Blue In, Blue Out" mosaic generator
 
-Self-contained mosaic script that does NOT depend on faiss, dlib, or the
-emosaic package. Uses only Pillow, OpenCV, and NumPy — all of which are
-already in Venv_001.
+Creates photomosaics from images, GIFs, and videos using monochrome-tinted
+tiles. Self-contained — only needs Pillow, OpenCV, and NumPy (no faiss,
+dlib, or emosaic).
 
-The algorithm is the same as worldveil/photomosaic:
-  1. Load tile images from a codebook directory
-  2. Resize each tile to the target cell size and flatten to a vector
-  3. Divide the target image into a grid of cells
-  4. For each cell, find the tile with the smallest L2 distance
-  5. Place the best-matching tile into the output mosaic
+How it works:
+  1. Generate (or load) a set of tiles at varying brightness levels, each
+     with a visible internal texture pattern.
+  2. Convert the target to grayscale.
+  3. Divide into a grid of cells.
+  4. For each cell, compute average brightness and pick the closest tile.
+  5. Place tiles into the output mosaic.
+
+For GIFs/videos, this is done per-frame and reassembled.
 
 Usage:
     conda activate Venv_001
 
-    # Full pipeline: generate tiles, convert target, build mosaic
-    python blue_mosaic.py \
-        --target tests/space.png \
-        --output ./output/space_mosaic.jpg \
-        --tile-mode blocks \
-        --tile-count 50 \
-        --color "#0000FF" \
-        --scale 12
+    # ── Still images ──
+    python blue_mosaic.py --target tests/space.png --output ./output/space_mosaic.jpg --tile-mode blocks --scale 6
 
-    # Use existing tile folder (e.g. from prepare_tiles.py)
-    python blue_mosaic.py \
-        --target tests/space.png \
-        --output ./output/space_mosaic.jpg \
-        --codebook-dir ./my_blue_tiles \
-        --scale 12
+    # ── GIF ──
+    python blue_mosaic.py --target tests/moon.gif --output ./output/moon_mosaic.gif --tile-mode blocks --scale 6 --color "#0072CE"
 
-    # Use real photos (converts them to blue first)
-    python blue_mosaic.py \
-        --target tests/space.png \
-        --output ./output/space_mosaic.jpg \
-        --source-images ./family_photos \
-        --color "#0000FF" \
-        --scale 10
+    # ── Video (mp4) ──
+    python blue_mosaic.py --target myvideo.mp4 --output ./output/mosaic_video.mp4 --tile-mode halftone --scale 8
+
+    # ── Other options ──
+    python blue_mosaic.py --target tests/space.png --output ./output/space_fine.jpg --tile-mode blocks --levels 128 --scale 4 --opacity 0.2 --best-k 3
+    python blue_mosaic.py --target tests/space.png --output ./output/space_photos.jpg --source-images ./family_photos --scale 8
+    python blue_mosaic.py --target tests/space.png --output ./output/space_custom.jpg --codebook-dir ./my_tiles --scale 8
 """
 
 import os
@@ -46,6 +39,7 @@ import glob
 import time
 import argparse
 import random
+import math
 
 import numpy as np
 import cv2
@@ -63,16 +57,35 @@ def lerp_color(c1, c2, t):
     return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
 
 
-# ─── Tile generation (built-in, no separate script needed) ──────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TILE GENERATORS
+#
+#  Each generator produces `count` tiles at evenly-spaced brightness levels.
+#  Tile at index 0 is darkest (near black), tile at index count-1 is brightest.
+#  Each tile has visible internal structure so the mosaic grid is apparent.
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_tiles_blocks(color_rgb, black_rgb, count, tile_w, tile_h):
-    """Pixel-block grid tiles with varying fill density."""
+    """
+    Ordered pixel-block grid. Cells fill from top-left in a consistent
+    scan order (not random), so brightness increases smoothly and the
+    pattern is structured, not noisy.
+    """
     tiles = []
-    cells_x = max(3, tile_w // 6)
-    cells_y = max(3, tile_h // 6)
+    # Grid: ~4-6px per cell so blocks are visible
+    cells_x = max(3, tile_w // 5)
+    cells_y = max(3, tile_h // 5)
     cell_w = tile_w / cells_x
     cell_h = tile_h / cells_y
     total_cells = cells_x * cells_y
+
+    # Build a fixed fill order: diagonal sweep for visual interest
+    cell_order = []
+    for diag in range(cells_x + cells_y - 1):
+        for cy in range(cells_y):
+            cx = diag - cy
+            if 0 <= cx < cells_x:
+                cell_order.append((cx, cy))
 
     for i in range(count):
         t = i / max(count - 1, 1)
@@ -80,49 +93,44 @@ def generate_tiles_blocks(color_rgb, black_rgb, count, tile_w, tile_h):
         draw = ImageDraw.Draw(img)
 
         n_filled = int(total_cells * t)
-        rng = random.Random(42 + i)
-        all_cells = [(cx, cy) for cy in range(cells_y) for cx in range(cells_x)]
-        rng.shuffle(all_cells)
-        filled = set(tuple(c) for c in all_cells[:n_filled])
-        fill = lerp_color(black_rgb, color_rgb, 0.4 + 0.6 * t)
+        fill = lerp_color(black_rgb, color_rgb, max(0.3, t))
 
-        for cy in range(cells_y):
-            for cx in range(cells_x):
-                if (cx, cy) in filled:
-                    x0 = int(cx * cell_w)
-                    y0 = int(cy * cell_h)
-                    x1 = int((cx + 1) * cell_w) - 1
-                    y1 = int((cy + 1) * cell_h) - 1
-                    draw.rectangle([x0, y0, x1, y1], fill=fill)
+        for idx in range(n_filled):
+            if idx >= len(cell_order):
+                break
+            cx, cy = cell_order[idx]
+            x0 = int(cx * cell_w)
+            y0 = int(cy * cell_h)
+            x1 = int((cx + 1) * cell_w) - 1
+            y1 = int((cy + 1) * cell_h) - 1
+            draw.rectangle([x0, y0, x1, y1], fill=fill)
 
-        # Convert PIL -> OpenCV (BGR)
-        arr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+        arr = np.array(img)[:, :, ::-1]
         tiles.append(arr)
     return tiles
 
 
 def generate_tiles_halftone(color_rgb, black_rgb, count, tile_w, tile_h):
-    """Dot-grid halftone tiles with varying dot radius."""
+    """
+    Single centered dot per tile. Dot radius scales with brightness.
+    Clean, classic halftone look.
+    """
     tiles = []
-    dots_x = max(2, tile_w // 12)
-    dots_y = max(2, tile_h // 12)
-    spacing_x = tile_w / dots_x
-    spacing_y = tile_h / dots_y
-    max_radius = min(spacing_x, spacing_y) * 0.48
+    max_radius = min(tile_w, tile_h) / 2.0
 
     for i in range(count):
         t = i / max(count - 1, 1)
         img = Image.new('RGB', (tile_w, tile_h), black_rgb)
         draw = ImageDraw.Draw(img)
 
-        if t > 0.01:
-            radius = max(1, max_radius * t)
-            fill = lerp_color(black_rgb, color_rgb, 0.5 + 0.5 * t)
-            for dy in range(dots_y):
-                for dx in range(dots_x):
-                    cx = spacing_x * (dx + 0.5)
-                    cy = spacing_y * (dy + 0.5)
-                    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=fill)
+        if t > 0.005:
+            radius = max(1, max_radius * math.sqrt(t))  # sqrt for perceptual scaling
+            cx, cy = tile_w / 2.0, tile_h / 2.0
+            fill = lerp_color(black_rgb, color_rgb, max(0.4, t))
+            draw.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
+                fill=fill
+            )
 
         arr = np.array(img)[:, :, ::-1]
         tiles.append(arr)
@@ -130,33 +138,35 @@ def generate_tiles_halftone(color_rgb, black_rgb, count, tile_w, tile_h):
 
 
 def generate_tiles_crosshatch(color_rgb, black_rgb, count, tile_w, tile_h):
-    """Line-hatching tiles with increasing density."""
-    import math
+    """
+    Line hatching with increasing density. Layers build up:
+    sparse diagonals -> cross-diagonals -> horizontal -> vertical.
+    """
     tiles = []
     for i in range(count):
         t = i / max(count - 1, 1)
         img = Image.new('RGB', (tile_w, tile_h), black_rgb)
-        draw = ImageDraw.Draw(img)
 
-        if t > 0.02 and t <= 0.95:
-            fill = lerp_color(black_rgb, color_rgb, 0.5 + 0.5 * t)
+        if t > 0.98:
+            img = Image.new('RGB', (tile_w, tile_h), color_rgb)
+        elif t > 0.01:
+            draw = ImageDraw.Draw(img)
+            fill = lerp_color(black_rgb, color_rgb, max(0.4, t))
             lw = max(1, int(1 + t * 2))
-            spacing = max(3, int(20 * (1 - t) + 3))
+            spacing = max(3, int(18 * (1 - t) + 3))
             diag = int(math.sqrt(tile_w**2 + tile_h**2))
 
             for off in range(-diag, diag, spacing):
                 draw.line([(off, 0), (off + tile_h, tile_h)], fill=fill, width=lw)
-            if t > 0.3:
+            if t > 0.25:
                 for off in range(-diag, diag, spacing):
                     draw.line([(tile_w - off, 0), (tile_w - off - tile_h, tile_h)], fill=fill, width=lw)
-            if t > 0.6:
+            if t > 0.55:
                 for y in range(0, tile_h, spacing):
                     draw.line([(0, y), (tile_w, y)], fill=fill, width=lw)
-            if t > 0.8:
+            if t > 0.80:
                 for x in range(0, tile_w, spacing):
                     draw.line([(x, 0), (x, tile_h)], fill=fill, width=lw)
-        elif t > 0.95:
-            img = Image.new('RGB', (tile_w, tile_h), color_rgb)
 
         arr = np.array(img)[:, :, ::-1]
         tiles.append(arr)
@@ -164,19 +174,28 @@ def generate_tiles_crosshatch(color_rgb, black_rgb, count, tile_w, tile_h):
 
 
 def generate_tiles_noise(color_rgb, black_rgb, count, tile_w, tile_h):
-    """Dithered noise tiles with varying pixel density."""
+    """
+    Ordered dithering (Bayer matrix style) — not random noise.
+    Produces a structured, repeatable dither pattern at each brightness level.
+    """
     tiles = []
+
+    # Build a Bayer-like threshold matrix tiled to cover the tile
+    bayer_2x2 = np.array([[0, 2], [3, 1]], dtype=np.float32) / 4.0
+    # Tile it to cover the full tile dimensions
+    reps_y = math.ceil(tile_h / 2)
+    reps_x = math.ceil(tile_w / 2)
+    threshold = np.tile(bayer_2x2, (reps_y, reps_x))[:tile_h, :tile_w]
+
     for i in range(count):
         t = i / max(count - 1, 1)
-        rng = np.random.RandomState(seed=42 + i)
-        mask = rng.random((tile_h, tile_w)) < t
-        fill = lerp_color(black_rgb, color_rgb, 0.5 + 0.5 * t)
+        mask = threshold < t
 
         arr = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
+        fill = lerp_color(black_rgb, color_rgb, max(0.4, t))
         arr[mask] = fill
         arr[~mask] = black_rgb
-        # This array is already in RGB order; convert to BGR for OpenCV
-        tiles.append(arr[:, :, ::-1].copy())
+        tiles.append(arr[:, :, ::-1].copy())  # RGB -> BGR
     return tiles
 
 
@@ -216,7 +235,7 @@ def load_tiles_from_dir(codebook_dir, tile_h, tile_w):
 # ─── Convert source photos to monochrome ────────────────────────────────────
 
 def convert_photos_to_blue(source_dir, output_dir, color_hex, black_hex, tile_h, tile_w):
-    """Convert real photos to monochrome, resize to tile dims, return as list."""
+    """Convert real photos to monochrome, resize to tile dims."""
     os.makedirs(output_dir, exist_ok=True)
     extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
 
@@ -235,12 +254,10 @@ def convert_photos_to_blue(source_dir, output_dir, color_hex, black_hex, tile_h,
                 mono = ImageOps.colorize(gray, black=black_hex, white=color_hex)
                 mono = mono.convert('RGB')
 
-                # Save to disk (for inspection) and also keep in memory
                 out_path = os.path.join(output_dir, os.path.splitext(filename)[0] + '.jpg')
                 mono.save(out_path, 'JPEG', quality=95)
 
-                # Convert to OpenCV BGR array at tile size
-                arr = np.array(mono)[:, :, ::-1]  # RGB -> BGR
+                arr = np.array(mono)[:, :, ::-1]
                 resized = cv2.resize(arr, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
                 tiles.append(resized)
         except Exception as e:
@@ -250,114 +267,311 @@ def convert_photos_to_blue(source_dir, output_dir, color_hex, black_hex, tile_h,
     return tiles
 
 
-# ─── Core mosaic algorithm ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MOSAIC ENGINE
+#
+#  Brightness-based matching: compute average brightness per tile and per
+#  target cell, then pick the tile whose brightness is closest. This is
+#  O(1) per cell (binary search into sorted brightness list) instead of
+#  O(N*D) brute-force L2.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def build_tile_index(tiles, tile_h, tile_w):
-    """
-    Flatten each tile into a vector and stack into a matrix.
-    Returns (matrix of shape [N, D], list of tile arrays).
-    """
-    vectors = []
+def compute_tile_brightness(tiles):
+    """Compute average brightness (0-255) for each tile."""
+    brightnesses = []
     for tile in tiles:
-        # Resize to exact tile dims (should already be, but ensure)
-        if tile.shape[0] != tile_h or tile.shape[1] != tile_w:
-            tile = cv2.resize(tile, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
-        v = tile.reshape(1, -1).astype(np.float32)
-        vectors.append(v)
-
-    matrix = np.vstack(vectors)  # shape: (N, tile_h * tile_w * 3)
-    return matrix
+        # Convert BGR -> grayscale value
+        gray = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
+        brightnesses.append(float(np.mean(gray)))
+    return np.array(brightnesses)
 
 
-def find_nearest_tile(query_vector, tile_matrix):
-    """Brute-force L2 nearest neighbor. Returns (index, distance)."""
-    # query_vector: (1, D), tile_matrix: (N, D)
-    diffs = tile_matrix - query_vector  # (N, D)
-    dists = np.sum(diffs ** 2, axis=1)  # (N,)
-    idx = np.argmin(dists)
-    return idx, dists[idx]
+def build_brightness_index(brightnesses):
+    """Sort tiles by brightness for fast lookup."""
+    order = np.argsort(brightnesses)
+    sorted_brightness = brightnesses[order]
+    return order, sorted_brightness
 
 
-def find_nearest_tile_topk(query_vector, tile_matrix, k):
-    """Return k nearest tile indices, pick one randomly."""
-    diffs = tile_matrix - query_vector
-    dists = np.sum(diffs ** 2, axis=1)
-    top_k_idx = np.argpartition(dists, k)[:k]
-    return random.choice(top_k_idx)
+def find_best_tile(target_brightness, sorted_brightness, sort_order, best_k=1):
+    """Find the tile(s) whose brightness best matches the target."""
+    # Binary search for closest brightness
+    idx = np.searchsorted(sorted_brightness, target_brightness)
+    idx = min(idx, len(sorted_brightness) - 1)
+
+    if best_k <= 1:
+        # Check idx and idx-1, return the closer one
+        if idx > 0:
+            d_left = abs(sorted_brightness[idx - 1] - target_brightness)
+            d_right = abs(sorted_brightness[idx] - target_brightness)
+            if d_left < d_right:
+                idx = idx - 1
+        return sort_order[idx]
+    else:
+        # Return random pick from top-k nearest
+        candidates = []
+        lo = max(0, idx - best_k)
+        hi = min(len(sorted_brightness), idx + best_k + 1)
+        for j in range(lo, hi):
+            candidates.append((abs(sorted_brightness[j] - target_brightness), sort_order[j]))
+        candidates.sort(key=lambda x: x[0])
+        top = candidates[:best_k]
+        return random.choice(top)[1]
 
 
-def mosaicify(target_image, tile_h, tile_w, tile_matrix, tiles, best_k=1, opacity=0.0):
+def mosaicify(target_gray, tile_h, tile_w, tiles, sorted_brightness, sort_order,
+              best_k=1, opacity=0.0, target_color=None, verbose=True):
     """
-    Build a mosaic from the target image using the tile codebook.
-    Same algorithm as emosaic.mosaicify but with pure NumPy L2 search.
+    Build the mosaic by matching each grid cell's average brightness
+    to the best tile.
     """
-    img_h, img_w, channels = target_image.shape
+    img_h, img_w = target_gray.shape
 
-    # Grid layout
     n_rows = img_h // tile_h
     n_cols = img_w // tile_w
     h_offset = (img_h % tile_h) // 2
     w_offset = (img_w % tile_w) // 2
 
-    mosaic = np.zeros_like(target_image)
-    total = n_rows * n_cols
-    count = 0
+    # Output mosaic (BGR, 3 channels)
+    out_h = n_rows * tile_h
+    out_w = n_cols * tile_w
+    mosaic = np.zeros((out_h, out_w, 3), dtype=np.uint8)
 
-    print(f"  Grid: {n_cols}x{n_rows} = {total} tiles")
+    total = n_rows * n_cols
+
+    if verbose:
+        print(f"  Grid: {n_cols} x {n_rows} = {total} tiles")
+        print(f"  Output: {out_w} x {out_h} px")
 
     for row in range(n_rows):
         for col in range(n_cols):
-            x = row * tile_h + h_offset
-            y = col * tile_w + w_offset
+            src_x = row * tile_h + h_offset
+            src_y = col * tile_w + w_offset
 
-            # Extract target patch and vectorize
-            patch = target_image[x:x + tile_h, y:y + tile_w]
+            patch = target_gray[src_x:src_x + tile_h, src_y:src_y + tile_w]
             if patch.shape[0] != tile_h or patch.shape[1] != tile_w:
                 continue
+            avg_brightness = float(np.mean(patch))
 
-            query = patch.reshape(1, -1).astype(np.float32)
+            tile_idx = find_best_tile(avg_brightness, sorted_brightness, sort_order, best_k)
+            tile = tiles[tile_idx]
 
-            # Find best matching tile
-            if best_k <= 1:
-                idx, _ = find_nearest_tile(query, tile_matrix)
-            else:
-                idx = find_nearest_tile_topk(query, tile_matrix, best_k)
+            out_x = row * tile_h
+            out_y = col * tile_w
+            mosaic[out_x:out_x + tile_h, out_y:out_y + tile_w] = tile
 
-            # Place tile
-            tile = tiles[idx]
-            if tile.shape[0] != tile_h or tile.shape[1] != tile_w:
-                tile = cv2.resize(tile, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
-            mosaic[x:x + tile_h, y:y + tile_w] = tile
-
-            count += 1
-            if count % 500 == 0 or count == total:
-                print(f"  Placed {count}/{total} tiles...")
-
-    # Trim to tiled area
-    mosaic = mosaic[h_offset:h_offset + n_rows * tile_h,
-                    w_offset:w_offset + n_cols * tile_w]
-
-    # Opacity blend with original (trimmed to same region)
-    if opacity > 0:
-        target_trimmed = target_image[h_offset:h_offset + n_rows * tile_h,
-                                       w_offset:w_offset + n_cols * tile_w]
-        mosaic = cv2.addWeighted(target_trimmed, opacity, mosaic, 1 - opacity, 0)
+    # Opacity blend with the monochrome target
+    if opacity > 0 and target_color is not None:
+        target_crop = target_color[h_offset:h_offset + out_h, w_offset:w_offset + out_w]
+        mosaic = cv2.addWeighted(target_crop, opacity, mosaic, 1 - opacity, 0)
 
     return mosaic
 
 
-# ─── Target preparation ─────────────────────────────────────────────────────
+# ─── Frame conversion helpers ────────────────────────────────────────────────
+
+def frame_to_gray(pil_frame):
+    """Convert a PIL frame to a numpy grayscale array."""
+    if pil_frame.mode in ('RGBA', 'LA', 'PA'):
+        pil_frame = pil_frame.convert('RGB')
+    elif pil_frame.mode != 'RGB':
+        pil_frame = pil_frame.convert('RGB')
+    return np.array(ImageOps.grayscale(pil_frame))
+
+
+def frame_to_color_bgr(pil_frame, color_hex, black_hex):
+    """Convert a PIL frame to monochrome-tinted BGR array (for opacity blend)."""
+    if pil_frame.mode in ('RGBA', 'LA', 'PA'):
+        pil_frame = pil_frame.convert('RGB')
+    elif pil_frame.mode != 'RGB':
+        pil_frame = pil_frame.convert('RGB')
+    gray = ImageOps.grayscale(pil_frame)
+    mono = ImageOps.colorize(gray, black=black_hex, white=color_hex)
+    return np.array(mono.convert('RGB'))[:, :, ::-1].copy()
+
+
+def cv2_frame_to_gray(bgr_frame):
+    """Convert an OpenCV BGR frame to grayscale numpy array."""
+    return cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+
+
+def cv2_frame_to_mono_bgr(bgr_frame, color_hex, black_hex):
+    """Convert an OpenCV BGR frame to monochrome-tinted BGR."""
+    gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+    # Use PIL for the colorize step
+    pil_gray = Image.fromarray(gray)
+    mono = ImageOps.colorize(pil_gray, black=black_hex, white=color_hex)
+    return np.array(mono.convert('RGB'))[:, :, ::-1].copy()
+
+
+# ─── Target preparation (still image) ───────────────────────────────────────
 
 def prepare_target(target_path, color_hex, black_hex):
-    """Convert target image to monochrome color scheme, return as OpenCV BGR array."""
+    """
+    Load target, convert to monochrome color version (for opacity blend)
+    and grayscale (for brightness matching).
+    Returns (grayscale_array, color_bgr_array).
+    """
     with Image.open(target_path) as img:
         if img.mode in ('RGBA', 'LA', 'PA'):
             img = img.convert('RGB')
+
         gray = ImageOps.grayscale(img)
+        gray_arr = np.array(gray)
+
         mono = ImageOps.colorize(gray, black=black_hex, white=color_hex)
         mono = mono.convert('RGB')
-        # PIL RGB -> OpenCV BGR
-        return np.array(mono)[:, :, ::-1].copy()
+        color_bgr = np.array(mono)[:, :, ::-1].copy()
+
+    return gray_arr, color_bgr
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GIF PROCESSING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def process_gif(target_path, output_path, tiles, sorted_brightness, sort_order,
+                tile_h, tile_w, color_hex, black_hex, best_k, opacity):
+    """
+    Process an animated GIF frame-by-frame, mosaic each frame,
+    and reassemble into an output GIF preserving frame timing.
+    """
+    gif = Image.open(target_path)
+
+    # Extract frame durations
+    durations = []
+    frames_pil = []
+    try:
+        while True:
+            duration = gif.info.get('duration', 100)  # ms per frame, default 100
+            durations.append(duration)
+            frames_pil.append(gif.copy())
+            gif.seek(gif.tell() + 1)
+    except EOFError:
+        pass
+
+    n_frames = len(frames_pil)
+    print(f"  GIF: {n_frames} frames, size: {frames_pil[0].size}")
+
+    mosaic_frames = []
+    for i, frame in enumerate(frames_pil):
+        gray = frame_to_gray(frame)
+        color_bgr = frame_to_color_bgr(frame, color_hex, black_hex) if opacity > 0 else None
+
+        mosaic_bgr = mosaicify(
+            gray, tile_h, tile_w,
+            tiles, sorted_brightness, sort_order,
+            best_k=best_k, opacity=opacity, target_color=color_bgr,
+            verbose=(i == 0),  # only print grid info for first frame
+        )
+
+        # BGR -> RGB -> PIL
+        mosaic_rgb = mosaic_bgr[:, :, ::-1]
+        mosaic_pil = Image.fromarray(mosaic_rgb)
+        mosaic_frames.append(mosaic_pil)
+
+        if (i + 1) % 10 == 0 or i == n_frames - 1:
+            print(f"  Frame {i + 1}/{n_frames}")
+
+    # Save as animated GIF
+    print(f"  Saving GIF ({n_frames} frames)...")
+    mosaic_frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=mosaic_frames[1:],
+        duration=durations,
+        loop=0,  # loop forever
+        optimize=False,
+    )
+    print(f"  Saved: {output_path}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VIDEO PROCESSING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def process_video(target_path, output_path, tiles, sorted_brightness, sort_order,
+                  tile_h, tile_w, color_hex, black_hex, best_k, opacity, fps=None):
+    """
+    Process a video file frame-by-frame using OpenCV.
+    Writes output as mp4. Does not handle audio (use ffmpeg to merge after).
+    """
+    cap = cv2.VideoCapture(target_path)
+    if not cap.isOpened():
+        print(f"ERROR: Cannot open video: {target_path}")
+        sys.exit(1)
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_fps = fps or src_fps
+
+    print(f"  Video: {src_w}x{src_h}, {total_frames} frames, {src_fps:.1f} fps")
+
+    # Compute output dimensions (trimmed to tile grid)
+    n_rows = src_h // tile_h
+    n_cols = src_w // tile_w
+    out_h = n_rows * tile_h
+    out_w = n_cols * tile_w
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, out_fps, (out_w, out_h), True)
+
+    frame_idx = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+
+        gray = cv2_frame_to_gray(frame)
+        color_bgr = cv2_frame_to_mono_bgr(frame, color_hex, black_hex) if opacity > 0 else None
+
+        mosaic = mosaicify(
+            gray, tile_h, tile_w,
+            tiles, sorted_brightness, sort_order,
+            best_k=best_k, opacity=opacity, target_color=color_bgr,
+            verbose=(frame_idx == 0),  # only print grid info for first frame
+        )
+
+        writer.write(mosaic)
+        frame_idx += 1
+
+        if frame_idx % 30 == 0 or frame_idx == total_frames:
+            print(f"  Frame {frame_idx}/{total_frames}")
+
+    cap.release()
+    writer.release()
+    print(f"  Saved: {output_path} ({frame_idx} frames)")
+
+    # Hint about audio
+    print(f"\n  NOTE: Audio is not included in the output video.")
+    print(f"  To add audio from the original, use ffmpeg:")
+    print(f"    ffmpeg -i \"{output_path}\" -i \"{target_path}\" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0? -shortest \"{os.path.splitext(output_path)[0]}_audio.mp4\"")
+
+
+# ─── Format detection ────────────────────────────────────────────────────────
+
+def detect_format(path):
+    """Detect if the target is an image, GIF, or video."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.gif':
+        # Check if it's animated
+        try:
+            img = Image.open(path)
+            try:
+                img.seek(1)
+                img.close()
+                return 'gif'
+            except EOFError:
+                img.close()
+                return 'image'  # single-frame GIF
+        except Exception:
+            return 'image'
+    elif ext in ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.wmv', '.flv'):
+        return 'video'
+    else:
+        return 'image'
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -368,11 +582,11 @@ def main():
     )
 
     parser.add_argument("--target", "-t", type=str, required=True,
-                        help="Target image to recreate as a mosaic")
+                        help="Target image, GIF, or video to recreate as a mosaic")
     parser.add_argument("--output", "-o", type=str, required=True,
-                        help="Output path for the mosaic image (e.g. ./output/mosaic.jpg)")
+                        help="Output path (.jpg for images, .gif for GIFs, .mp4 for video)")
 
-    # Tile source options (pick one)
+    # Tile source (pick one)
     tile_group = parser.add_mutually_exclusive_group()
     tile_group.add_argument("--codebook-dir", dest="codebook_dir", type=str,
                             help="Use existing tile images from this folder")
@@ -380,48 +594,50 @@ def main():
                             help="Convert real photos to monochrome tiles")
     tile_group.add_argument("--tile-mode", dest="tile_mode", type=str,
                             choices=["blocks", "halftone", "crosshatch", "noise"],
-                            help="Generate synthetic tiles (default if nothing else specified)")
+                            help="Generate synthetic tiles (default: blocks)")
 
-    # Generation settings
-    parser.add_argument("--tile-count", dest="tile_count", type=int, default=50,
-                        help="Number of synthetic tiles (default: 50)")
+    # Tile settings
+    parser.add_argument("--levels", type=int, default=64,
+                        help="Number of brightness levels / tiles to generate (default: 64)")
     parser.add_argument("--color", "-c", type=str, default="#0000FF",
                         help="Hex color for bright areas (default: #0000FF blue)")
     parser.add_argument("--black", "-b", dest="black_color", type=str, default="#000000",
                         help="Hex color for dark areas (default: #000000 black)")
 
     # Mosaic settings
-    parser.add_argument("--scale", type=int, default=12,
-                        help="Tile scale multiplier (default: 12)")
+    parser.add_argument("--scale", type=int, default=6,
+                        help="Tile scale — smaller = more tiles = finer detail (default: 6)")
     parser.add_argument("--height-aspect", dest="height_aspect", type=float, default=4.0,
                         help="Height aspect (default: 4)")
     parser.add_argument("--width-aspect", dest="width_aspect", type=float, default=3.0,
                         help="Width aspect (default: 3)")
     parser.add_argument("--best-k", dest="best_k", type=int, default=1,
-                        help="Pick from top K matches randomly (default: 1 = best match)")
+                        help="Pick from top K brightness matches (default: 1)")
     parser.add_argument("--opacity", type=float, default=0.0,
-                        help="Blend original image on top (0.0 = pure mosaic, default: 0.0)")
+                        help="Blend original on top (0.0=pure mosaic, 0.3=subtle, default: 0.0)")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Override output FPS for video (default: same as source)")
 
     args = parser.parse_args()
 
-    # Tile dimensions
     tile_h = int(args.height_aspect * args.scale)
     tile_w = int(args.width_aspect * args.scale)
-
     color_rgb = hex_to_rgb(args.color)
     black_rgb = hex_to_rgb(args.black_color)
 
+    # Detect input format
+    fmt = detect_format(args.target)
+
     print("=" * 60)
-    print("  BLUE MOSAIC - Standalone Generator")
+    print("  BLUE MOSAIC")
     print("=" * 60)
-    print(f"  Target:  {args.target}")
+    print(f"  Target:  {args.target} ({fmt})")
     print(f"  Output:  {args.output}")
     print(f"  Color:   {args.black_color} -> {args.color}")
-    print(f"  Scale:   {args.scale} (tiles: {tile_w}x{tile_h} px)")
-    print(f"  Aspect:  {args.height_aspect}:{args.width_aspect}")
+    print(f"  Scale:   {args.scale} -> tiles are {tile_w}x{tile_h} px")
+    print(f"  Levels:  {args.levels} brightness steps")
     print()
 
-    # Ensure output directory exists
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
 
     # ─── Step 1: Get tiles ───────────────────────────────────────────────
@@ -436,49 +652,74 @@ def main():
             args.source_images, out_dir,
             args.color, args.black_color, tile_h, tile_w)
     else:
-        # Default to synthetic blocks if nothing specified
         mode = args.tile_mode or "blocks"
-        print(f"  Generating {args.tile_count} synthetic '{mode}' tiles...")
-        gen_fn = TILE_GENERATORS[mode]
-        tiles = gen_fn(color_rgb, black_rgb, args.tile_count, tile_w, tile_h)
+        print(f"  Generating {args.levels} '{mode}' tiles at {tile_w}x{tile_h} px...")
+        tiles = TILE_GENERATORS[mode](color_rgb, black_rgb, args.levels, tile_w, tile_h)
 
     if not tiles:
-        print("ERROR: No tiles available. Exiting.")
+        print("ERROR: No tiles. Exiting.")
         sys.exit(1)
 
+    # Build brightness index (shared across all frames)
+    brightnesses = compute_tile_brightness(tiles)
+    sort_order, sorted_brightness = build_brightness_index(brightnesses)
+
     print(f"  {len(tiles)} tiles ready ({time.time() - start:.1f}s)")
+    print(f"  Brightness range: {sorted_brightness[0]:.1f} - {sorted_brightness[-1]:.1f}")
 
-    # ─── Step 2: Prepare target ──────────────────────────────────────────
-    print("\nStep 2: Preparing target image...")
-    target_bgr = prepare_target(args.target, args.color, args.black_color)
-    print(f"  Target size: {target_bgr.shape[1]}x{target_bgr.shape[0]} px")
+    # ─── Step 2: Process based on format ─────────────────────────────────
 
-    # Save the monochrome target for reference
-    mono_path = os.path.splitext(args.output)[0] + '_target_mono.jpg'
-    cv2.imwrite(mono_path, target_bgr)
-    print(f"  Saved monochrome target: {mono_path}")
+    if fmt == 'gif':
+        print(f"\nStep 2: Processing animated GIF...")
+        process_gif(
+            args.target, args.output,
+            tiles, sorted_brightness, sort_order,
+            tile_h, tile_w,
+            args.color, args.black_color,
+            args.best_k, args.opacity,
+        )
 
-    # ─── Step 3: Build index and run mosaic ──────────────────────────────
-    print("\nStep 3: Building mosaic...")
-    start = time.time()
+    elif fmt == 'video':
+        print(f"\nStep 2: Processing video...")
+        process_video(
+            args.target, args.output,
+            tiles, sorted_brightness, sort_order,
+            tile_h, tile_w,
+            args.color, args.black_color,
+            args.best_k, args.opacity,
+            fps=args.fps,
+        )
 
-    tile_matrix = build_tile_index(tiles, tile_h, tile_w)
-    print(f"  Tile index: {tile_matrix.shape[0]} tiles, {tile_matrix.shape[1]} dimensions")
+    else:
+        # Still image
+        print(f"\nStep 2: Preparing target image...")
+        target_gray, target_color = prepare_target(args.target, args.color, args.black_color)
+        print(f"  Target size: {target_gray.shape[1]} x {target_gray.shape[0]} px")
 
-    mosaic = mosaicify(
-        target_bgr, tile_h, tile_w,
-        tile_matrix, tiles,
-        best_k=args.best_k,
-        opacity=args.opacity,
-    )
+        mono_path = os.path.splitext(args.output)[0] + '_target_mono.jpg'
+        cv2.imwrite(mono_path, target_color)
+        print(f"  Saved monochrome target: {mono_path}")
 
-    elapsed = time.time() - start
-    print(f"  Mosaic built in {elapsed:.1f}s")
+        print(f"\nStep 3: Building mosaic...")
+        start = time.time()
 
-    # ─── Step 4: Save ────────────────────────────────────────────────────
-    cv2.imwrite(args.output, mosaic)
-    print(f"\nDone! Mosaic saved to: {args.output}")
-    print(f"  Size: {mosaic.shape[1]}x{mosaic.shape[0]} px")
+        mosaic = mosaicify(
+            target_gray, tile_h, tile_w,
+            tiles, sorted_brightness, sort_order,
+            best_k=args.best_k,
+            opacity=args.opacity,
+            target_color=target_color,
+        )
+
+        elapsed = time.time() - start
+        print(f"  Built in {elapsed:.1f}s")
+
+        cv2.imwrite(args.output, mosaic)
+        print(f"\nDone! Saved: {args.output}")
+        print(f"  Mosaic size: {mosaic.shape[1]} x {mosaic.shape[0]} px")
+        return
+
+    print(f"\nDone! Saved: {args.output}")
 
 
 if __name__ == '__main__':
