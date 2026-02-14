@@ -57,24 +57,28 @@ def lerp_color(c1, c2, t):
     return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
 
 
-def add_alpha_from_brightness(bgr_tile, black_rgb):
+def add_alpha_from_brightness(bgr_tile, black_rgb, color_rgb):
     """
-    Convert a 3-channel BGR tile to 4-channel BGRA where pixels matching
-    the black/background color become fully transparent (alpha=0) and all
-    other pixels (the colored pattern) stay fully opaque (alpha=255).
-    A small tolerance is used so near-black pixels from anti-aliasing
-    also become transparent.
+    Convert a 3-channel BGR tile to 4-channel BGRA. The original pixel
+    colors are preserved exactly; alpha is derived from each pixel's
+    distance from the black color relative to the distance between
+    black and the chosen color. This avoids the problem of grayscale
+    luminance underweighting blue.
     """
-    # black_rgb is in RGB order; convert to BGR for comparison
     black_bgr = np.array([black_rgb[2], black_rgb[1], black_rgb[0]], dtype=np.float32)
+    color_bgr = np.array([color_rgb[2], color_rgb[1], color_rgb[0]], dtype=np.float32)
     tile_f = bgr_tile.astype(np.float32)
-    # Per-pixel L2 distance from the black color
+
+    # Full range: distance from black to the chosen color
+    full_dist = np.sqrt(np.sum((color_bgr - black_bgr) ** 2))
+    if full_dist < 1.0:
+        full_dist = 1.0
+
+    # Each pixel's distance from black, normalized to [0, 1]
     dist = np.sqrt(np.sum((tile_f - black_bgr) ** 2, axis=2))
-    # Pixels within a small tolerance of the background color -> transparent
-    # Everything else -> fully opaque
-    tolerance = 10.0
-    alpha = np.where(dist <= tolerance, 0, 255).astype(np.uint8)
-    # Build BGRA
+    t = np.clip(dist / full_dist, 0.0, 1.0)
+    alpha = (t * 255.0).astype(np.uint8)
+
     bgra = np.dstack([bgr_tile, alpha])
     return bgra
 
@@ -129,7 +133,7 @@ def generate_tiles_blocks(color_rgb, black_rgb, count, tile_w, tile_h, transpare
 
         arr = np.array(img)[:, :, ::-1]
         if transparent:
-            arr = add_alpha_from_brightness(arr, black_rgb)
+            arr = add_alpha_from_brightness(arr, black_rgb, color_rgb)
         tiles.append(arr)
     return tiles
 
@@ -158,7 +162,7 @@ def generate_tiles_halftone(color_rgb, black_rgb, count, tile_w, tile_h, transpa
 
         arr = np.array(img)[:, :, ::-1]
         if transparent:
-            arr = add_alpha_from_brightness(arr, black_rgb)
+            arr = add_alpha_from_brightness(arr, black_rgb, color_rgb)
         tiles.append(arr)
     return tiles
 
@@ -196,7 +200,7 @@ def generate_tiles_crosshatch(color_rgb, black_rgb, count, tile_w, tile_h, trans
 
         arr = np.array(img)[:, :, ::-1]
         if transparent:
-            arr = add_alpha_from_brightness(arr, black_rgb)
+            arr = add_alpha_from_brightness(arr, black_rgb, color_rgb)
         tiles.append(arr)
     return tiles
 
@@ -225,7 +229,7 @@ def generate_tiles_noise(color_rgb, black_rgb, count, tile_w, tile_h, transparen
         arr[~mask] = black_rgb
         bgr = arr[:, :, ::-1].copy()  # RGB -> BGR
         if transparent:
-            bgr = add_alpha_from_brightness(bgr, black_rgb)
+            bgr = add_alpha_from_brightness(bgr, black_rgb, color_rgb)
         tiles.append(bgr)
     return tiles
 
@@ -733,14 +737,14 @@ def main():
     if args.codebook_dir:
         tiles = load_tiles_from_dir(args.codebook_dir, tile_h, tile_w)
         if args.transparent:
-            tiles = [add_alpha_from_brightness(t, black_rgb) for t in tiles]
+            tiles = [add_alpha_from_brightness(t, black_rgb, color_rgb) for t in tiles]
     elif args.source_images:
         out_dir = os.path.join(os.path.dirname(args.output), "blue_tiles")
         tiles = convert_photos_to_blue(
             args.source_images, out_dir,
             args.color, args.black_color, tile_h, tile_w)
         if args.transparent:
-            tiles = [add_alpha_from_brightness(t, black_rgb) for t in tiles]
+            tiles = [add_alpha_from_brightness(t, black_rgb, color_rgb) for t in tiles]
     else:
         mode = args.tile_mode or "blocks"
         print(f"  Generating {args.levels} '{mode}' tiles at {tile_w}x{tile_h} px...")
