@@ -59,19 +59,21 @@ def lerp_color(c1, c2, t):
 
 def add_alpha_from_brightness(bgr_tile, black_rgb):
     """
-    Convert a 3-channel BGR tile to 4-channel BGRA where alpha is derived
-    from each pixel's distance from the black color. Pixels matching
-    black_rgb exactly get alpha=0 (fully transparent); pixels at maximum
-    distance get alpha=255 (fully opaque).
+    Convert a 3-channel BGR tile to 4-channel BGRA where pixels matching
+    the black/background color become fully transparent (alpha=0) and all
+    other pixels (the colored pattern) stay fully opaque (alpha=255).
+    A small tolerance is used so near-black pixels from anti-aliasing
+    also become transparent.
     """
     # black_rgb is in RGB order; convert to BGR for comparison
     black_bgr = np.array([black_rgb[2], black_rgb[1], black_rgb[0]], dtype=np.float32)
     tile_f = bgr_tile.astype(np.float32)
     # Per-pixel L2 distance from the black color
     dist = np.sqrt(np.sum((tile_f - black_bgr) ** 2, axis=2))
-    # Max possible distance is sqrt(255^2 * 3) ≈ 441.67
-    max_dist = math.sqrt(255**2 * 3)
-    alpha = np.clip(dist / max_dist * 255.0, 0, 255).astype(np.uint8)
+    # Pixels within a small tolerance of the background color -> transparent
+    # Everything else -> fully opaque
+    tolerance = 10.0
+    alpha = np.where(dist <= tolerance, 0, 255).astype(np.uint8)
     # Build BGRA
     bgra = np.dstack([bgr_tile, alpha])
     return bgra
